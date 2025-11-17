@@ -3,6 +3,7 @@ HTTP communication with LastPass servers
 """
 
 import requests
+import time
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlencode
 from .exceptions import NetworkException, LoginFailedException
@@ -21,7 +22,7 @@ class HTTPClient:
         })
     
     def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None,
-             session: Optional[Session] = None) -> Tuple[bytes, int]:
+             session: Optional[Session] = None, max_retries: int = 3) -> Tuple[bytes, int]:
         """
         POST request to LastPass
         Returns: (response_body, status_code)
@@ -36,11 +37,27 @@ class HTTPClient:
             data["token"] = session.token
             data["sessionid"] = session.sessionid
         
-        try:
-            response = self.session.post(url, data=data, timeout=30)
-            return response.content, response.status_code
-        except requests.RequestException as e:
-            raise NetworkException(f"HTTP request failed: {e}")
+        # Retry logic for rate limiting and transient errors
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(url, data=data, timeout=30)
+                
+                # Handle rate limiting with exponential backoff
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
+                        time.sleep(wait_time)
+                        continue
+                
+                return response.content, response.status_code
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Brief delay before retry
+                    continue
+                raise NetworkException(f"HTTP request failed: {e}")
+        
+        # Should not reach here, but just in case
+        raise NetworkException(f"Failed after {max_retries} retries")
     
     def get_iterations(self, username: str) -> int:
         """Get PBKDF2 iteration count for a username"""
@@ -93,7 +110,10 @@ class HTTPClient:
         """Download encrypted vault blob"""
         content, status = self.post("getaccts.php", {"mobile": "1", "b64": "1", "hash": "0.0"}, session=session)
         
-        if status != 200:
+        # Post already retried on 429, so if we still got 429, it's persistent
+        if status == 429:
+            raise NetworkException(f"Rate limited by LastPass (HTTP 429). Please wait a few minutes before retrying.")
+        elif status != 200:
             raise NetworkException(f"Failed to download blob: HTTP {status}")
         
         return content
